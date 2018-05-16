@@ -415,32 +415,33 @@ static BOOL is_tablet_cursor(const char *name, const char *type)
     return FALSE;
 }
 
-static UINT get_cursor_type(const char *name, const char *type)
+static BOOL is_stylus(const char *name, const char *type)
 {
     int i;
     static const char* tablet_stylus_whitelist[] = {
         "stylus",
         "wizardpen",
         "acecad",
-        "pen",
         NULL
     };
 
-    /* First check device type to avoid cases where name is "Pen and Eraser" and type is "ERASER" */
-    for (i=0; tablet_stylus_whitelist[i] != NULL; i++) {
-        if (type && match_token(type, tablet_stylus_whitelist[i]))
-            return CSR_TYPE_PEN;
-    }
-    if (type && match_token(type, "eraser"))
-        return CSR_TYPE_ERASER;
     for (i=0; tablet_stylus_whitelist[i] != NULL; i++) {
         if (name && match_token(name, tablet_stylus_whitelist[i]))
-            return CSR_TYPE_PEN;
+            return TRUE;
+        if (type && match_token(type, tablet_stylus_whitelist[i]))
+            return TRUE;
     }
-    if (name && match_token(name, "eraser"))
-        return CSR_TYPE_ERASER;
 
-    return CSR_TYPE_OTHER;
+    return FALSE;
+}
+
+static BOOL is_eraser(const char *name, const char *type)
+{
+    if (name && match_token(name, "eraser"))
+        return TRUE;
+    if (type && match_token(type, "eraser"))
+        return TRUE;
+    return FALSE;
 }
 
 /* cursors are placed in gSysCursor rows depending on their type
@@ -536,8 +537,6 @@ BOOL CDECL X11DRV_LoadTabletInfo(HWND hwnddefault)
     gSysContext.lcSensZ = 65536;
     gSysContext.lcSysSensX= 65536;
     gSysContext.lcSysSensY= 65536;
-    gSysContext.lcOutExtX= GetSystemMetrics(SM_CXSCREEN);
-    gSysContext.lcOutExtY= GetSystemMetrics(SM_CYSCREEN);
 
     /* initialize cursors */
     disable_system_cursors();
@@ -551,10 +550,13 @@ BOOL CDECL X11DRV_LoadTabletInfo(HWND hwnddefault)
         PK_BUTTONS |  PK_X | PK_Y | PK_NORMAL_PRESSURE | PK_ORIENTATION;
     strcpyW(gSysDevice.PNPID, SZ_NON_PLUGINPLAY);
 
+    wine_tsx11_lock();
+
     devices = pXListInputDevices(data->display, &num_devices);
     if (!devices)
     {
         WARN("XInput Extensions reported as not available\n");
+        wine_tsx11_unlock();
         return FALSE;
     }
     TRACE("XListInputDevices reports %d devices\n", num_devices);
@@ -565,7 +567,7 @@ BOOL CDECL X11DRV_LoadTabletInfo(HWND hwnddefault)
         WTI_CURSORS_INFO cursor;
 
         TRACE("Device %i:  [id %d|name %s|type %s|num_classes %d|use %d]\n",
-                loop, (int) devices[loop].id, devices[loop].name, debugstr_a(device_type),
+                loop, (int) devices[loop].id, devices[loop].name, device_type ? device_type : "",
                 devices[loop].num_classes, devices[loop].use );
 
         switch (devices[loop].use)
@@ -617,10 +619,10 @@ BOOL CDECL X11DRV_LoadTabletInfo(HWND hwnddefault)
             }
             MultiByteToWideChar(CP_UNIXCP, 0, target->name, -1, cursor.NAME, WT_MAX_NAME_LEN);
 
-            if (! is_tablet_cursor(target->name, device_type))
+            if (! is_tablet_cursor(target->name, device_type) && ! devices[loop].type == XInternAtom(data->display, XI_TABLET, False))
             {
                 WARN("Skipping device %d [name %s|type %s]; not apparently a tablet cursor type device.  If this is wrong, please report it to wine-devel@winehq.org\n",
-                     loop, devices[loop].name, debugstr_a(device_type));
+                     loop, devices[loop].name, device_type ? device_type : "");
                 break;
             }
 
@@ -635,7 +637,13 @@ BOOL CDECL X11DRV_LoadTabletInfo(HWND hwnddefault)
             cursor.NPBTNMARKS[1] = 1 ;
             cursor.CAPABILITIES = CRC_MULTIMODE;
 
-            cursor.TYPE = get_cursor_type(target->name, device_type);
+            /* prefer finding TYPE_PEN(most capable) */
+            if (is_stylus(target->name, device_type) || devices[loop].type == XInternAtom(data->display, XI_TABLET, False))
+                cursor.TYPE = CSR_TYPE_PEN;
+            else if (is_eraser(target->name, device_type))
+                cursor.TYPE = CSR_TYPE_ERASER;
+            else
+                cursor.TYPE = CSR_TYPE_OTHER;
 
             any = target->inputclassinfo;
 
@@ -769,6 +777,7 @@ BOOL CDECL X11DRV_LoadTabletInfo(HWND hwnddefault)
         WARN("Did not find a valid stylus, unable to determine system context parameters. Wintab is disabled.\n");
     }
 
+    wine_tsx11_unlock();
     return TRUE;
 }
 
@@ -798,6 +807,7 @@ static void set_button_state(int curnum, XID deviceid)
     int loop;
     int rc = 0;
 
+    wine_tsx11_lock();
     device = pXOpenDevice(data->display,deviceid);
     state = pXQueryDeviceState(data->display,device);
 
@@ -822,6 +832,7 @@ static void set_button_state(int curnum, XID deviceid)
         }
     }
     pXFreeDeviceState(state);
+    wine_tsx11_unlock();
     button_state[curnum] = rc;
 }
 
@@ -832,20 +843,21 @@ static int cursor_from_device(DWORD deviceid, LPWTI_CURSORS_INFO *cursorp)
         if (gSysCursor[i].ACTIVE && gSysCursor[i].PHYSID == deviceid)
         {
             *cursorp = &gSysCursor[i];
+            TRACE("device id %d mapped to a cursor %d\n", (int) deviceid, i);
             return i;
         }
-
+    
     ERR("Could not map device id %d to a cursor\n", (int) deviceid);
     return -1;
 }
 
-static BOOL motion_event( HWND hwnd, XEvent *event )
+static void motion_event( HWND hwnd, XEvent *event )
 {
     XDeviceMotionEvent *motion = (XDeviceMotionEvent *)event;
     LPWTI_CURSORS_INFO cursor;
     int curnum = cursor_from_device(motion->deviceid, &cursor);
     if (curnum < 0)
-        return FALSE;
+        return;
 
     memset(&gMsgPacket,0,sizeof(WTPACKET));
 
@@ -866,16 +878,17 @@ static BOOL motion_event( HWND hwnd, XEvent *event )
     gMsgPacket.pkNormalPressure = motion->axis_data[2];
     gMsgPacket.pkButtons = get_button_state(curnum);
     SendMessageW(hwndTabletDefault,WT_PACKET,gMsgPacket.pkSerialNumber,(LPARAM)hwnd);
-    return TRUE;
+TRACE("motion->axes_count=%d, motion->axis_data[0]=%d, motion->axis_data[1]=%d, motion->axis_data[2]=%d\n", 
+	motion->axes_count, motion->axis_data[0], motion->axis_data[1], motion->axis_data[2]);
 }
 
-static BOOL button_event( HWND hwnd, XEvent *event )
+static void button_event( HWND hwnd, XEvent *event )
 {
     XDeviceButtonEvent *button = (XDeviceButtonEvent *) event;
     LPWTI_CURSORS_INFO cursor;
     int curnum = cursor_from_device(button->deviceid, &cursor);
     if (curnum < 0)
-        return FALSE;
+        return;
 
     memset(&gMsgPacket,0,sizeof(WTPACKET));
 
@@ -896,19 +909,17 @@ static BOOL button_event( HWND hwnd, XEvent *event )
     gMsgPacket.pkNormalPressure = button->axis_data[2];
     gMsgPacket.pkButtons = get_button_state(curnum);
     SendMessageW(hwndTabletDefault,WT_PACKET,gMsgPacket.pkSerialNumber,(LPARAM)hwnd);
-    return TRUE;
 }
 
-static BOOL key_event( HWND hwnd, XEvent *event )
+static void key_event( HWND hwnd, XEvent *event )
 {
     if (event->type == key_press_type)
         FIXME("Received tablet key press event\n");
     else
         FIXME("Received tablet key release event\n");
-    return FALSE;
 }
 
-static BOOL proximity_event( HWND hwnd, XEvent *event )
+static void proximity_event( HWND hwnd, XEvent *event )
 {
     XProximityNotifyEvent *proximity = (XProximityNotifyEvent *) event;
     LPWTI_CURSORS_INFO cursor;
@@ -918,7 +929,7 @@ static BOOL proximity_event( HWND hwnd, XEvent *event )
     TRACE("hwnd=%p\n", hwnd);
 
     if (curnum < 0)
-        return FALSE;
+        return;
 
     memset(&gMsgPacket,0,sizeof(WTPACKET));
 
@@ -937,6 +948,8 @@ static BOOL proximity_event( HWND hwnd, XEvent *event )
     gMsgPacket.pkNormalPressure = proximity->axis_data[2];
     gMsgPacket.pkButtons = get_button_state(curnum);
 
+//TRACE("proximity->deviceid=%d, proximity->axes_count=%d proximity->axis_data[0]=%d, proximity->axis_data[1]=%d, proximity->axis_data[2]=%d", 
+//		proximity->deviceid, proximity->axes_count, proximity->axis_data[0], proximity->axis_data[1], proximity->axis_data[2]);
     /* FIXME: LPARAM loword is true when cursor entering context, false when leaving context
      * This needs to be handled here or in wintab32.  Using the proximity_in_type is not correct
      * but kept for now.
@@ -947,7 +960,6 @@ static BOOL proximity_event( HWND hwnd, XEvent *event )
     proximity_info = MAKELPARAM((event->type == proximity_in_type),
                      (event->type == proximity_in_type) || (event->type == proximity_out_type));
     SendMessageW(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, proximity_info);
-    return TRUE;
 }
 
 /***********************************************************************
@@ -969,6 +981,7 @@ int CDECL X11DRV_AttachEventQueueToTablet(HWND hOwner)
 
     TRACE("Creating context for window %p (%lx)  %i cursors\n", hOwner, win, gNumCursors);
 
+    wine_tsx11_lock();
     devices = pXListInputDevices(data->display, &num_devices);
 
     X11DRV_expect_error(data->display,Tablet_ErrorHandler,NULL);
@@ -981,8 +994,11 @@ int CDECL X11DRV_AttachEventQueueToTablet(HWND hOwner)
 
         /* the cursor name fits in the buffer because too long names are skipped */
         WideCharToMultiByte(CP_UNIXCP, 0, gSysCursor[cur_loop].NAME, -1, cursorNameA, WT_MAX_NAME_LEN, NULL, NULL);
+
+        TRACE("!!!!!Cursor Name %s Cursor phyid %d\n", cursorNameA, (int)gSysCursor[cur_loop].PHYSID);
+
         for (loop=0; loop < num_devices; loop ++)
-            if (strcmp(devices[loop].name, cursorNameA) == 0)
+            if (strcmp(devices[loop].name, cursorNameA) == 0 &&  gSysCursor[cur_loop].PHYSID == devices[loop].id)
                 target = &devices[loop];
         if (!target) {
             WARN("Cursor Name %s not found in list of targets.\n", cursorNameA);
@@ -1038,6 +1054,7 @@ int CDECL X11DRV_AttachEventQueueToTablet(HWND hOwner)
     X11DRV_check_error();
 
     if (NULL != devices) pXFreeDeviceList(devices);
+    wine_tsx11_unlock();
     return 0;
 }
 
