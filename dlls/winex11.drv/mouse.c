@@ -25,6 +25,7 @@
 #include <X11/Xlib.h>
 #include <X11/cursorfont.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
 #include <X11/extensions/XInput2.h>
 #endif
@@ -1776,6 +1777,17 @@ static BOOL X11DRV_DeviceChanged( XGenericEventCookie *xev )
     return TRUE;
 }
 
+/* XWayland only reports normalized absolute values and raw relative values,
+ * all under an absolute valuator.
+ */
+static inline int xwayland_workaround(void)
+{
+    static int workaround = -1;
+    if (workaround != -1) return workaround;
+    workaround = !!getenv("WAYLAND_DISPLAY");
+    return workaround;
+}
+
 /***********************************************************************
  *           X11DRV_RawMotion
  */
@@ -1878,15 +1890,31 @@ static BOOL X11DRV_RawMotion( XGenericEventCookie *xev )
         }
         if (i == x_abs->number)
         {
-            raw_input.data.mouse.usFlags = MOUSE_MOVE_ABSOLUTE | MOUSE_VIRTUAL_DESKTOP;
-            raw_x = raw_val;
-            raw_input.data.mouse.lLastX = raw_x * (65536 / (x_abs->max - x_abs->min));
+            if (xwayland_workaround())
+            {
+                raw_input.data.mouse.usFlags = MOUSE_MOVE_RELATIVE;
+                raw_input.data.mouse.lLastX = raw_x = raw_val;
+            }
+            else
+            {
+                raw_input.data.mouse.usFlags = MOUSE_MOVE_ABSOLUTE | MOUSE_VIRTUAL_DESKTOP;
+                raw_x = raw_val;
+                raw_input.data.mouse.lLastX = raw_x * (65536 / (x_abs->max - x_abs->min));
+            }
         }
         if (i == y_abs->number)
         {
-            raw_input.data.mouse.usFlags = MOUSE_MOVE_ABSOLUTE | MOUSE_VIRTUAL_DESKTOP;
-            raw_y = raw_val;
-            raw_input.data.mouse.lLastY = raw_y * (65536 / (y_abs->max - y_abs->min));
+            if (xwayland_workaround())
+            {
+                raw_input.data.mouse.usFlags = MOUSE_MOVE_RELATIVE;
+                raw_input.data.mouse.lLastY = raw_y = raw_val;
+            }
+            else
+            {
+                raw_input.data.mouse.usFlags = MOUSE_MOVE_ABSOLUTE | MOUSE_VIRTUAL_DESKTOP;
+                raw_y = raw_val;
+                raw_input.data.mouse.lLastY = raw_y * (65536 / (y_abs->max - y_abs->min));
+            }
         }
         if (i == wheel->number)
         {
